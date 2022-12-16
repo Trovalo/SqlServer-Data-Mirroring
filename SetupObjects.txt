@@ -1,0 +1,337 @@
+USE [Mirror]
+GO
+
+/****** Object:  Table [config].[MirrorCopy]    Script Date: 16/12/22 17:51:00 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [config].[MirrorCopy](
+	[ID] [int] IDENTITY(1,1) NOT NULL,
+	[Source_Server] [nvarchar](50) NOT NULL,
+	[Source_DataBase] [nvarchar](50) NOT NULL,
+	[Source_Schema] [nvarchar](50) NOT NULL,
+	[Source_TableName] [nvarchar](50) NOT NULL,
+	[Destination_Server] [nvarchar](50) NOT NULL,
+	[Destination_DataBase] [nvarchar](50) NOT NULL,
+	[Destination_Schema] [nvarchar](50) NOT NULL,
+	[Destination_TableName] [nvarchar](50) NOT NULL,
+	[Enabled] [bit] NOT NULL,
+	[MirroringType] [nvarchar](50) NOT NULL,
+ CONSTRAINT [PK_MirrorCopy] PRIMARY KEY CLUSTERED 
+(
+	[ID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+/****** Object:  Table [config].[MirrorCopyLog]    Script Date: 16/12/22 17:51:00 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [config].[MirrorCopyLog](
+	[ID] [int] IDENTITY(1,1) NOT NULL,
+	[ExecutionID] [uniqueidentifier] NOT NULL,
+	[DateTime] [datetime2](0) NOT NULL,
+	[Source] [nvarchar](200) NULL,
+	[Destination] [nvarchar](200) NULL,
+	[Status] [nvarchar](50) NULL,
+	[Message] [nvarchar](400) NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[ID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+ALTER TABLE [config].[MirrorCopyLog] ADD  CONSTRAINT [Constr_Def_DateTime]  DEFAULT (CONVERT([datetime2](0),getdate())) FOR [DateTime]
+GO
+
+ALTER TABLE [config].[MirrorCopy]  WITH CHECK ADD  CONSTRAINT [CK_MirroringType] CHECK  (([MirroringType]='CreateIfMissing' OR [MirroringType]='DropCreate' OR [MirroringType]='InsertOnly'))
+GO
+
+ALTER TABLE [config].[MirrorCopy] CHECK CONSTRAINT [CK_MirroringType]
+GO
+
+
+
+
+/****** Object:  StoredProcedure [config].[CopyTable]    Script Date: 16/12/22 17:51:19 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [config].[CopyTable]
+	 @Source_Server nvarchar(50) = @@SERVERNAME
+	,@Source_DataBase nvarchar(50)
+	,@Source_Schema nvarchar(50)
+	,@Source_TableName nvarchar(50)
+	,@Destination_Server nvarchar(50) = @@SERVERNAME
+	,@Destination_DataBase nvarchar(50)
+	,@Destination_Schema nvarchar(50)
+	,@Destination_TableName nvarchar(50)
+	,@MirroringType nvarchar(50)
+
+AS
+BEGIN
+
+--Common/shared variables
+DECLARE @SqlString nvarchar(1000)
+DECLARE @SqlOutput bit
+DECLARE @Destination_IsRemote bit;
+
+DECLARE @SourceFullName nvarchar(200) = CONCAT_WS('.',QUOTENAME(@Source_Server),QUOTENAME(@Source_DataBase),QUOTENAME(@Source_Schema),QUOTENAME(@Source_TableName))
+
+DECLARE @DestinationFullname nvarchar(200)
+IF @Destination_Server != @@SERVERNAME	BEGIN--if different specify linked server
+	SET @DestinationFullname = CONCAT_WS('.',QUOTENAME(@Destination_Server),QUOTENAME(@Destination_DataBase),QUOTENAME(@Destination_Schema),QUOTENAME(@Destination_TableName))
+	SET @Destination_IsRemote = 1
+END
+ELSE BEGIN	--if same (local) server omit server (can't DROP or use INTO with ServerName)
+	SET @DestinationFullname = CONCAT_WS('.',QUOTENAME(@Destination_DataBase),QUOTENAME(@Destination_Schema),QUOTENAME(@Destination_TableName))
+	SET @Destination_IsRemote = 0
+END
+
+--============ Check if source table Exist ============================================
+SET @SqlString = '
+SELECT 
+	@ObjExistOUT = IIF(COUNT(*) > 0 ,1 ,0)
+FROM '+ CONCAT_WS('.',QUOTENAME(@Source_Server),QUOTENAME(@Source_DataBase)) +'.sys.objects
+WHERE
+	[type] IN (''U'',''V'')
+	AND [name] = @pSource_TableName
+	AND [schema_id] = SCHEMA_ID(@pSource_Schema)
+';
+
+EXECUTE sp_executesql
+	 @Query = @SqlString
+	,@params = N'@ObjExistOUT bit OUTPUT, @pSource_TableName sysname, @pSource_Schema sysname'
+	,@ObjExistOUT = @SqlOutput OUTPUT, @pSource_TableName = @Source_TableName, @pSource_Schema = @Source_Schema
+
+IF @SqlOutput = 0
+	THROW 50000, 'The specified source table does not exist', 1;
+
+--============ CREATE DESTINATION TABLE IF NOT EXISTING (SUPPORTED ONLY IF DESTINATION IS THE LOCAL SERVER) =====================
+IF @MirroringType = 'CreateIfMissing' BEGIN
+
+	IF @Destination_IsRemote = 1
+		THROW 50000, 'CreateIfNotExists is supported only if the destination is the local instance ', 1;
+
+	SET @SqlString = '
+	SELECT
+		@ObjExistOUT = IIF(COUNT(*) > 0 ,1 ,0)
+	FROM '+ CONCAT_WS('.',QUOTENAME(@Destination_Server),QUOTENAME(@Destination_DataBase)) +'.sys.objects
+	WHERE
+		[type] IN (''U'',''V'')
+		AND [name] = @pDestination_TableName
+		AND [schema_id] = SCHEMA_ID(@pDestination_Schema)
+	';
+	EXECUTE sp_executesql 
+		 @Query = @SqlString
+		,@params = N'@ObjExistOUT bit OUTPUT, @pDestination_TableName sysname, @pDestination_Schema sysname'
+		,@ObjExistOUT = @SqlOutput OUTPUT, @pDestination_TableName = @Destination_TableName, @pDestination_Schema = @Destination_Schema
+	
+	--CREATE DESTINATION TABLE AND INSERT
+	IF @SqlOutput = 0 BEGIN	
+
+		SET @SqlString = '
+		SELECT *
+		INTO '+ @DestinationFullname +'
+		FROM '+ @SourceFullName +'
+		'
+		EXECUTE sp_executesql @Query = @SqlString
+	END
+	ELSE BEGIN
+		--INSERT ONLY
+		SET @SqlString = '
+		TRUNCATE TABLE '+@DestinationFullname+'
+		INSERT INTO '+@DestinationFullname+' SELECT * FROM '+ @SourceFullName
+		EXECUTE sp_executesql @Query = @SqlString
+	END
+
+END
+
+--============ DROP AND RE-CREATE DESTINATION TABLE (SUPPORTED ONLY IF DESTINATION IS THE LOCAL SERVER) =====================
+IF @MirroringType = 'DropCreate' BEGIN
+
+	IF @Destination_IsRemote = 1
+		THROW 50000, 'DropAndCreate is supported only if the destination is the local instance ', 1;
+
+
+	--DROP AND SELECT INTO
+	SET @SqlString = '
+	DROP TABLE IF EXISTS '+ @DestinationFullname +'
+	SELECT *
+	INTO '+ @DestinationFullname +'
+	FROM '+ @SourceFullName +'
+	'
+	EXECUTE sp_executesql @Query = @SqlString
+
+END
+--============ PERFORM A SIMPLE INSERT, THE DESTINATION TABLE MUST EXIST=====================
+IF @MirroringType = 'InsertOnly' BEGIN
+	SET @SqlString = '
+	TRUNCATE TABLE '+@DestinationFullname+'
+	INSERT INTO '+@DestinationFullname+' SELECT * FROM '+ @SourceFullName
+	EXECUTE sp_executesql @Query = @SqlString
+END
+
+END
+GO
+
+/****** Object:  StoredProcedure [config].[ExecuteMirrorCopy]    Script Date: 16/12/22 17:51:19 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE PROCEDURE [config].[ExecuteMirrorCopy] AS
+
+BEGIN TRY
+	--Param for logging
+	DECLARE @Log_ExececutionID uniqueidentifier = NEWID()
+	DECLARE @Log_Source	AS NVARCHAR(200)
+	DECLARE @Log_Destination AS NVARCHAR(200)
+	DECLARE @Log_Message AS NVARCHAR(400)
+
+	--param for table mirroring
+	DECLARE @Par_Source_Server			AS NVARCHAR(50)
+	DECLARE @Par_Source_DataBase		AS NVARCHAR(50)
+	DECLARE @Par_Source_Schema			AS NVARCHAR(50)
+	DECLARE @Par_Source_TableName		AS NVARCHAR(50)
+	DECLARE @Par_Destination_Server		AS NVARCHAR(50)
+	DECLARE @Par_Destination_DataBase	AS NVARCHAR(50)
+	DECLARE @Par_Destination_Schema		AS NVARCHAR(50)
+	DECLARE @Par_Destination_TableName	AS NVARCHAR(50)
+	DECLARE @Par_MirroringType AS NVARCHAR(50)
+
+	EXEC [config].[WriteMirrorCopyLog] 
+	 @ExecutionID = @Log_ExececutionID 
+	,@Status ='Started'
+	,@Message = 'MirrorCopy started'
+	;
+
+	DECLARE TableListCursor CURSOR LOCAL STATIC FOR
+	SELECT
+		 [Source_Server]
+		,[Source_DataBase]
+		,[Source_Schema]
+		,[Source_TableName]
+		,[Destination_Server]
+		,[Destination_DataBase]
+		,[Destination_Schema]
+		,[Destination_TableName]
+		,[MirroringType]
+	FROM [config].[MirrorCopy]
+	WHERE [Enabled] = 1
+
+	OPEN TableListCursor
+	WHILE 1 = 1 BEGIN	--Loop break condition is specified below
+	
+		FETCH NEXT FROM TableListCursor
+		INTO 
+			 @Par_Source_Server			
+			,@Par_Source_DataBase		
+			,@Par_Source_Schema			
+			,@Par_Source_TableName		
+			,@Par_Destination_Server		
+			,@Par_Destination_DataBase
+			,@Par_Destination_Schema		
+			,@Par_Destination_TableName
+			,@Par_MirroringType
+		;
+
+		if @@FETCH_STATUS <> 0 BREAK;	--break loop, the check must be done after FETCH NEXT (otherwise the last row run twice)
+
+		SET @Log_Source = CONCAT_WS('.', QUOTENAME(@Par_Source_Server), QUOTENAME(@Par_Source_DataBase), QUOTENAME(@Par_Source_Schema) ,QUOTENAME(@Par_Source_TableName))
+		SET @Log_Destination = CONCAT_WS('.', QUOTENAME(@Par_Destination_Server), QUOTENAME(@Par_Destination_DataBase), QUOTENAME(@Par_Destination_Schema) ,QUOTENAME(@Par_Destination_TableName))
+
+		EXEC [config].[WriteMirrorCopyLog] 
+		 @ExecutionID = @Log_ExececutionID
+		,@Source = @Log_Source
+		,@Destination = @Log_Destination
+		,@Status = 'Started'
+		;
+	
+		EXECUTE [config].[CopyTable] 
+			 @Source_Server = @Par_Source_Server
+			,@Source_DataBase = @Par_Source_DataBase
+			,@Source_Schema = @Par_Source_Schema
+			,@Source_TableName = @Par_Source_TableName
+			,@Destination_Server = @Par_Destination_Server
+			,@Destination_DataBase = @Par_Destination_DataBase
+			,@Destination_Schema = @Par_Destination_Schema
+			,@Destination_TableName = @Par_Destination_TableName
+			,@MirroringType = @Par_MirroringType
+		;
+
+		EXEC [config].[WriteMirrorCopyLog] 
+		 @ExecutionID = @Log_ExececutionID
+		,@Source = @Log_Source
+		,@Destination = @Log_Destination
+		,@Status = 'Completed'
+		;
+	END
+
+	CLOSE TableListCursor
+	DEALLOCATE TableListCursor
+
+	EXEC [config].[WriteMirrorCopyLog] 
+	 @ExecutionID = @Log_ExececutionID
+	,@Status ='Completed'
+	,@Message = 'MirrorCopy completed'
+	;
+END TRY
+BEGIN CATCH
+	--Log Exception and throw exception
+	SELECT @Log_Message = CONCAT_WS(' - ', ERROR_NUMBER(), ERROR_MESSAGE())
+	EXEC [config].[WriteMirrorCopyLog] 
+	 @ExecutionID = @Log_ExececutionID
+	,@Status ='Error'
+	,@Message = @Log_Message
+	;
+	THROW
+END CATCH
+
+GO
+
+/****** Object:  StoredProcedure [config].[WriteMirrorCopyLog]    Script Date: 16/12/22 17:51:19 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE PROCEDURE [config].[WriteMirrorCopyLog] (
+	 @ExecutionID uniqueidentifier
+	,@Source nvarchar(200) = NULL
+	,@Destination nvarchar(200) = NULL
+	,@Status nvarchar(20)
+	,@Message nvarchar(400) = NULL ) AS 
+
+INSERT INTO [config].[MirrorCopyLog] (
+	 [ExecutionID]
+	,[Source]
+	,[Destination]
+	,[Status]
+	,[Message]
+) VALUES (
+	 @ExecutionID
+	,@Source
+	,@Destination
+	,@Status
+	,@Message
+)
+GO
+
+
